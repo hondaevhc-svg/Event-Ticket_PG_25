@@ -2,13 +2,14 @@ import os
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
+import io
 
 # -------------------------------------------------
 # BASIC CONFIG
 # -------------------------------------------------
 st.set_page_config(page_title="🎟️ Event Management System", layout="wide")
 
-# --- CSS: center align table content ---
+# CSS: Center align table content and force header styling
 st.markdown("""
     <style>
     [data-testid="stTable"] td, [data-testid="stTable"] th {
@@ -20,17 +21,16 @@ st.markdown("""
     .stDataFrame th {
         text-align: center !important;
     }
+    /* Style for the Total Row to make it stand out */
+    .stDataFrame tr:last-child {
+        font-weight: bold;
+        background-color: #f0f2f6;
+    }
     </style>
 """, unsafe_allow_html=True)
 
 # -------------------------------------------------
-# SESSION STATE
-# -------------------------------------------------
-if "active_tab" not in st.session_state:
-    st.session_state.active_tab = "📊 Dashboard"
-
-# -------------------------------------------------
-# CONSTANTS / HELPERS
+# HELPERS
 # -------------------------------------------------
 def _get_password(key: str) -> str | None:
     return (
@@ -44,6 +44,12 @@ MENU_UPDATE_PASSWORD = _get_password("menu_update") or _get_password("admin")
 
 def now_ts() -> str:
     return pd.Timestamp.now(tz="UTC").isoformat()
+
+def to_excel_download(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+    return output.getvalue()
 
 # -------------------------------------------------
 # DB CONNECTION & CACHED LOAD
@@ -59,51 +65,20 @@ def load_all_data():
     tickets_df = pd.read_sql("SELECT * FROM tickets", engine)
     menu_df = pd.read_sql("SELECT * FROM menu", engine)
 
-    column_map = {}
-    for col in tickets_df.columns:
-        col_lower = col.lower().strip()
-        if col_lower in ["ticketid", "ticket_id"] and col != "TicketID":
-            column_map[col] = "TicketID"
-        elif col_lower == "visitor_seats" and col != "Visitor_Seats":
-            column_map[col] = "Visitor_Seats"
-        elif col_lower == "sold" and col != "Sold":
-            column_map[col] = "Sold"
-        elif col_lower == "visited" and col != "Visited":
-            column_map[col] = "Visited"
-        elif col_lower == "customer" and col != "Customer":
-            column_map[col] = "Customer"
-        elif col_lower == "admit" and col != "Admit":
-            column_map[col] = "Admit"
-        elif col_lower == "seq" and col != "Seq":
-            column_map[col] = "Seq"
-        elif col_lower == "timestamp" and col != "Timestamp":
-            column_map[col] = "Timestamp"
-        elif col_lower == "type" and col != "Type":
-            column_map[col] = "Type"
-        elif col_lower == "category" and col != "Category":
-            column_map[col] = "Category"
-    
-    if column_map:
-        tickets_df = tickets_df.rename(columns=column_map)
+    column_map = {col: col.strip() for col in tickets_df.columns}
+    tickets_df = tickets_df.rename(columns=column_map)
     
     if tickets_df.empty:
         tickets_df = pd.DataFrame(columns=["TicketID", "Category", "Type", "Admit", "Seq", "Sold", "Visited", "Customer", "Visitor_Seats", "Timestamp"])
         return tickets_df, menu_df
     
-    if "TicketID" not in tickets_df.columns:
-        raise ValueError("TicketID column is required but not found in tickets table.")
-    
-    # Cleaning
+    # Data Cleaning
     tickets_df["Visitor_Seats"] = pd.to_numeric(tickets_df.get("Visitor_Seats", 0), errors="coerce").fillna(0).astype(int)
     tickets_df["Sold"] = tickets_df.get("Sold", False).fillna(False).astype(bool)
     tickets_df["Visited"] = tickets_df.get("Visited", False).fillna(False).astype(bool)
-    tickets_df["Customer"] = tickets_df.get("Customer", "").fillna("").astype(str)
     tickets_df["Admit"] = pd.to_numeric(tickets_df.get("Admit", 1), errors="coerce").fillna(1).astype(int)
     tickets_df["TicketID"] = tickets_df["TicketID"].astype(str).str.zfill(4)
-    if "Timestamp" not in tickets_df.columns: tickets_df["Timestamp"] = None
-    if "Type" not in tickets_df.columns: tickets_df["Type"] = ""
-    if "Category" not in tickets_df.columns: tickets_df["Category"] = ""
-
+    
     return tickets_df, menu_df
 
 def save_tickets_df(tickets_df: pd.DataFrame):
@@ -120,7 +95,7 @@ def save_both(tickets_df: pd.DataFrame, menu_df: pd.DataFrame):
     st.cache_data.clear()
 
 def custom_sort(df: pd.DataFrame) -> pd.DataFrame:
-    if "Seq" not in df.columns: return df
+    if "Seq" not in df.columns or df.empty: return df
     sort_key = df["Seq"].apply(lambda x: float("inf") if pd.isna(x) or x in [0, "0"] else float(x))
     return df.assign(_k=sort_key).sort_values("_k").drop(columns="_k")
 
@@ -157,17 +132,15 @@ with st.sidebar:
 # -------------------------------------------------
 # TABS
 # -------------------------------------------------
-tab_labels = ["📊 Dashboard", "💰 Sales", "🚶 Visitors", "⚙️ Edit Menu"]
-tabs = st.tabs(tab_labels)
+tabs = st.tabs(["📊 Dashboard", "💰 Sales", "🚶 Visitors", "⚙️ Edit Menu"])
 
-# 1. DASHBOARD
+# --- 1. DASHBOARD ---
 with tabs[0]:
     st.subheader("Inventory & Visitor Analytics")
-    df = tickets.copy()
-    if df.empty:
+    if tickets.empty:
         st.info("No tickets found.")
     else:
-        summary = df.groupby(["Seq", "Type", "Category", "Admit"], dropna=False).agg(
+        summary = tickets.groupby(["Seq", "Type", "Category", "Admit"], dropna=False).agg(
             Total_Tickets=("TicketID", "count"),
             Tickets_Sold=("Sold", "sum"),
             Total_Visitors=("Visitor_Seats", "sum"),
@@ -178,14 +151,31 @@ with tabs[0]:
         summary["Balance_Seats"] = summary["Total_Seats"] - summary["Seats_sold"]
         summary["Balance_Visitors"] = summary["Seats_sold"] - summary["Total_Visitors"]
         summary = custom_sort(summary)
-        st.dataframe(summary, hide_index=True, use_container_width=True)
 
-# 2. SALES
+        # Add Total Row
+        total_row = pd.DataFrame({
+            "Seq": ["TOTAL"], "Type": [""], "Category": [""], "Admit": [""],
+            "Total_Tickets": [summary["Total_Tickets"].sum()],
+            "Tickets_Sold": [summary["Tickets_Sold"].sum()],
+            "Total_Visitors": [summary["Total_Visitors"].sum()],
+            "Total_Seats": [summary["Total_Seats"].sum()],
+            "Seats_sold": [summary["Seats_sold"].sum()],
+            "Balance_Tickets": [summary["Balance_Tickets"].sum()],
+            "Balance_Seats": [summary["Balance_Seats"].sum()],
+            "Balance_Visitors": [summary["Balance_Visitors"].sum()]
+        })
+        summary_final = pd.concat([summary, total_row], ignore_index=True)
+        
+        # Display with height to ensure scrollability
+        st.dataframe(summary_final, hide_index=True, use_container_width=True, height=500)
+
+# --- 2. SALES ---
 with tabs[1]:
     st.subheader("Sales Management")
     col_in, col_out = st.columns([1, 1.2])
     with col_in:
-        sale_tab = st.radio("Action", ["Manual", "Bulk Upload", "Reverse Sale"], horizontal=True, key="sale_action")
+        sale_tab = st.radio("Action", ["Manual", "Bulk Upload", "Reverse Sale"], horizontal=True)
+        
         if sale_tab == "Manual":
             s_type = st.radio("Type", ["Public", "Guest"], horizontal=True)
             s_cat_options = menu.loc[menu["Type"] == s_type, "Category"].dropna().unique().tolist()
@@ -206,23 +196,37 @@ with tabs[1]:
             else: st.info("No tickets available.")
 
         elif sale_tab == "Bulk Upload":
-            st.info("📋 Upload Excel/CSV with columns: `Ticket_ID`, `Customer`")
+            st.info("📋 Columns: `Ticket_ID`, `Customer`")
             uploaded_file = st.file_uploader("Upload File", type=["csv", "xlsx"], key="sale_bulk")
             if uploaded_file:
                 bulk_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
                 if {"Ticket_ID", "Customer"}.issubset(bulk_df.columns):
                     bulk_df["Ticket_ID"] = bulk_df["Ticket_ID"].astype(str).str.zfill(4)
-                    if st.button("Process Bulk Sale"):
+                    
+                    # 1) Cross-reference against Recent Sales (already Sold)
+                    already_sold_mask = bulk_df["Ticket_ID"].isin(tickets[tickets["Sold"]]["TicketID"])
+                    already_sold_list = bulk_df[already_sold_mask]
+                    valid_to_sell = bulk_df[~already_sold_mask]
+
+                    if not already_sold_list.empty:
+                        st.warning(f"⚠️ {len(already_sold_list)} Tickets are already in Sales History.")
+                        st.download_button("📥 Download 'Already Sold' List", 
+                                         data=to_excel_download(already_sold_list), 
+                                         file_name="already_sold_tickets.xlsx")
+
+                    if st.button("Process Valid Bulk Sales"):
                         id_to_index = {tid: i for i, tid in enumerate(tickets["TicketID"].tolist())}
-                        for _, row in bulk_df.iterrows():
+                        count = 0
+                        for _, row in valid_to_sell.iterrows():
                             tid = row["Ticket_ID"]
                             if tid in id_to_index:
                                 idx = id_to_index[tid]
                                 tickets.at[idx, "Sold"] = True
                                 tickets.at[idx, "Customer"] = row["Customer"]
                                 tickets.at[idx, "Timestamp"] = now_ts()
+                                count += 1
                         save_tickets_df(tickets)
-                        st.success("✅ Bulk Sales Processed.")
+                        st.success(f"✅ {count} Sales Processed.")
                         st.rerun()
                 else: st.error("Invalid Columns.")
 
@@ -242,15 +246,17 @@ with tabs[1]:
 
     with col_out:
         st.write("**Recent Sales History**")
-        st.dataframe(tickets[tickets["Sold"]].sort_values("Timestamp", ascending=False).head(10), hide_index=True)
+        # Removed .head(10) and added height for full record viewing via scroll
+        st.dataframe(tickets[tickets["Sold"]].sort_values("Timestamp", ascending=False), 
+                     hide_index=True, use_container_width=True, height=500)
 
-# 3. VISITORS
+# --- 3. VISITORS ---
 with tabs[2]:
     st.subheader("Visitor Entry Management")
     v_in, v_out = st.columns([1, 1.2])
 
     with v_in:
-        v_action = st.radio("Action", ["Entry", "Bulk Upload", "Reverse Entry"], horizontal=True, key="vis_action")
+        v_action = st.radio("Action", ["Entry", "Bulk Upload", "Reverse Entry"], horizontal=True)
 
         if v_action == "Entry":
             v_type = st.radio("Entry Type", ["Public", "Guest"], horizontal=True)
@@ -269,45 +275,49 @@ with tabs[2]:
                         tickets.at[idx, "Visitor_Seats"] = int(v_count)
                         tickets.at[idx, "Timestamp"] = now_ts()
                         save_tickets_df(tickets)
-                        st.success(f"✅ Ticket {tid} entry confirmed.")
+                        st.success(f"✅ Entry confirmed.")
                         st.rerun()
-            else: st.info("No eligible tickets.")
+            else: st.info("No eligible (sold & unvisited) tickets found.")
 
         elif v_action == "Bulk Upload":
-            st.info("📋 Upload Excel/CSV with columns: `Ticket_ID`, `Visitor_Count`. Conflicting Ticket IDs will be overwritten.")
+            st.info("📋 Columns: `Ticket_ID`, `Visitor_Count`. Only SOLD tickets allowed.")
             uploaded_file = st.file_uploader("Choose File", type=["csv", "xlsx"], key="vis_bulk")
-            
             if uploaded_file:
-                try:
-                    bulk_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-                    st.write("**Preview:**", bulk_df.head(3))
+                bulk_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+                if {"Ticket_ID", "Visitor_Count"}.issubset(bulk_df.columns):
+                    bulk_df["Ticket_ID"] = bulk_df["Ticket_ID"].astype(str).str.zfill(4)
                     
-                    if {"Ticket_ID", "Visitor_Count"}.issubset(bulk_df.columns):
-                        if st.button("Process Bulk Visitor Upload"):
-                            bulk_df["Ticket_ID"] = bulk_df["Ticket_ID"].astype(str).str.zfill(4)
-                            id_to_index = {tid: i for i, tid in enumerate(tickets["TicketID"].tolist())}
-                            
-                            updated_count = 0
-                            for _, row in bulk_df.iterrows():
-                                tid = row["Ticket_ID"]
-                                if tid in id_to_index:
-                                    idx = id_to_index[tid]
-                                    # Overwrite logic
-                                    tickets.at[idx, "Visited"] = True
-                                    tickets.at[idx, "Visitor_Seats"] = int(row["Visitor_Count"])
-                                    tickets.at[idx, "Timestamp"] = now_ts()
-                                    updated_count += 1
-                            
-                            save_tickets_df(tickets)
-                            st.success(f"✅ Processed {updated_count} records (including overwrites).")
-                            st.rerun()
-                    else:
-                        st.error("❌ File must contain `Ticket_ID` and `Visitor_Count` columns.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                    # Logic: Only allow 'Sold' tickets
+                    sold_ids = tickets[tickets["Sold"]]["TicketID"].tolist()
+                    unsold_mask = ~bulk_df["Ticket_ID"].isin(sold_ids)
+                    
+                    unsold_list = bulk_df[unsold_mask]
+                    valid_to_entry = bulk_df[~unsold_mask]
+
+                    if not unsold_list.empty:
+                        st.error(f"❌ {len(unsold_list)} Tickets have NOT been sold yet.")
+                        st.download_button("📥 Download 'Unsold' List", 
+                                         data=to_excel_download(unsold_list), 
+                                         file_name="unsold_visitor_attempts.xlsx")
+
+                    if st.button("Process Valid Visitor Upload"):
+                        id_to_index = {tid: i for i, tid in enumerate(tickets["TicketID"].tolist())}
+                        count = 0
+                        for _, row in valid_to_entry.iterrows():
+                            tid = row["Ticket_ID"]
+                            if tid in id_to_index:
+                                idx = id_to_index[tid]
+                                tickets.at[idx, "Visited"] = True
+                                tickets.at[idx, "Visitor_Seats"] = int(row["Visitor_Count"])
+                                tickets.at[idx, "Timestamp"] = now_ts()
+                                count += 1
+                        save_tickets_df(tickets)
+                        st.success(f"✅ {count} Visitor records processed.")
+                        st.rerun()
+                else: st.error("Invalid Columns.")
 
         elif v_action == "Reverse Entry":
-            rv_tid = st.text_input("Enter Ticket ID to reverse entry", key="rev_vis_manual")
+            rv_tid = st.text_input("Enter Ticket ID to reverse entry")
             if st.button("Reverse Entry"):
                 idx_list = tickets.index[tickets["TicketID"] == rv_tid.zfill(4)].tolist()
                 if idx_list:
@@ -320,9 +330,11 @@ with tabs[2]:
 
     with v_out:
         st.write("**Recent Visitors**")
-        st.dataframe(tickets[tickets["Visited"]].sort_values("Timestamp", ascending=False).head(10), hide_index=True)
+        # Removed .head(10) and added height for full record viewing via scroll
+        st.dataframe(tickets[tickets["Visited"]].sort_values("Timestamp", ascending=False), 
+                     hide_index=True, use_container_width=True, height=500)
 
-# 4. EDIT MENU
+# --- 4. EDIT MENU ---
 with tabs[3]:
     st.subheader("Menu & Series Configuration")
     menu_display = custom_sort(menu.copy())
@@ -331,24 +343,25 @@ with tabs[3]:
     menu_pass_input = st.text_input("Enter Menu Update Password", type="password")
     if st.button("Update Database Menu"):
         if menu_pass_input == MENU_UPDATE_PASSWORD:
-            # Rebuild logic...
             new_tickets_list = []
             existing_map = {row["TicketID"]: row.to_dict() for _, row in tickets.iterrows()}
             for _, m_row in edited_menu.iterrows():
                 series = str(m_row.get("Series", "")).strip()
                 if "-" in series:
-                    start, end = map(int, series.split("-"))
-                    for tid in range(start, end + 1):
-                        tid_str = str(tid).zfill(4)
-                        if tid_str in existing_map:
-                            new_tickets_list.append(existing_map[tid_str])
-                        else:
-                            new_tickets_list.append({
-                                "TicketID": tid_str, "Category": m_row.get("Category"),
-                                "Type": m_row.get("Type"), "Admit": int(m_row.get("Admit", 1)),
-                                "Seq": m_row.get("Seq"), "Sold": False, "Visited": False,
-                                "Customer": "", "Visitor_Seats": 0, "Timestamp": None
-                            })
+                    try:
+                        start, end = map(int, series.split("-"))
+                        for tid in range(start, end + 1):
+                            tid_str = str(tid).zfill(4)
+                            if tid_str in existing_map:
+                                new_tickets_list.append(existing_map[tid_str])
+                            else:
+                                new_tickets_list.append({
+                                    "TicketID": tid_str, "Category": m_row.get("Category"),
+                                    "Type": m_row.get("Type"), "Admit": int(m_row.get("Admit", 1)),
+                                    "Seq": m_row.get("Seq"), "Sold": False, "Visited": False,
+                                    "Customer": "", "Visitor_Seats": 0, "Timestamp": None
+                                })
+                    except: continue
             save_both(pd.DataFrame(new_tickets_list), edited_menu)
             st.success("✅ Menu Updated.")
             st.rerun()
